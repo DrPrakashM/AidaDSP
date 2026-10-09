@@ -1,463 +1,59 @@
-/*
- AIDA Mono Reverb Sketch
- 	
- This sketch controls a Mono Reverb algorithm and the mix with Dry Audio Signal. 
- 
- This sketch was written for the Arduino, and will not work on other boards.
- 	
- The circuit:
- 
- Audio:
- * Input range 2.0Vrms (5.66Vpp, 8.23dBu)
- * Output range 0.9Vrms (0-2.5Vpp, 1.30dBu) 
- 
- PC:
- * Please connect with PuTTY on Arduino USB Serial with a PC for a minimal user interface
- 
- NOTE:
- Attenuation Out/In = 2.264, to have out = in you must provide 7.097dB of gain through DSP algorithm
- or externally with active LPF filter.
- 
- created November 2014
- by Massimo Pennazio
- 
- This example code is in the public domain.
- 
- */
-
-#include <Arduino.h>
-#include <pins_arduino.h>
 #include <Wire.h>
-#include "AidaFW.h"
-#include "AidaDSP.h"
-#include "LiquidCrystal.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-#define EVER (;;)
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 
-// DEFINES USER INTERFACE
-#define VOLMAX 6.00
-#define VOLMIN -80.00
+const int sensorPin[4] = {1, 2, 3, 4};
+const char* label[4]   = {"S1", "S2", "S3", "S4"};
+const int BUZZER = 5, LED_R = 6, LED_Y = 7, LED_G = 10, BTN = 11;
 
-#define ON 1
-#define OFF 0
+const int CAUTION = 40;  // percent
+const int ALERT   = 70;  // percent
+bool muted = false;
 
-#define Q_HIGH   3.00f
-#define Q_LOW    1.41f
-#define FREQ1    61.00f;
-#define FREQ2    500.00f;
-#define FREQ3    2228.00f;
-#define FREQ4    10100.00f;
-
-#define PIN_LED  13
-#define LED_1    23
-#define LED_2    25
-#define PUSH_1   18
-#define PUSH_2   19
-
-// FUNCTION PROTOTYPES
-void spettacolino();
-void clearAndHome(void);
-void check_program(void);
-void check_param(void);
-void check_config(void);
-void mix(uint8_t percent);
-
-// GLOBAL VARIABLES
-// ENCODER
-int32_t OldPulses = 0;
-
-// UI
-uint8_t count = 0;
-uint8_t function = 0;
-uint8_t mute = OFF;
-uint8_t submenu = OFF;
-uint8_t preset = 0;
-uint8_t restore = OFF;
-uint8_t restoreflag = false;
-uint16_t PotValue = 0;
-uint32_t timec=0, prevtimec=0;
-
-float volume = 0.00;
-float pot1 = 0.00;
-
-// Configure pins for LCD display
-LiquidCrystal lcd(17, 16, 15, 14, 6, 7); // RS, EN, D4, D3, D2, D1
-
-void setup()
-{
-  // put your setup code here, to run once:
-  // I/O
-  pinMode(PIN_LED, OUTPUT);
-  pinMode(LED_1, OUTPUT);
-  digitalWrite(LED_1, HIGH);
-  pinMode(LED_2, OUTPUT);
-  digitalWrite(LED_2, HIGH);
-  pinMode(PUSH_1, INPUT_PULLUP);
-  pinMode(PUSH_2, INPUT_PULLUP);
-
-  // open the USBSerial port
+void setup() {
   Serial.begin(115200);
-  clearAndHome();
-  Serial.println(F("Aida DSP control with ARDUINO")); // Welcome message
-  Serial.print(F("0x"));
-  Serial.println((DEVICE_ADDR_7bit<<1)&~0x01, HEX);
+  Wire.begin(8, 9);               // SDA = GPIO 8, SCL = GPIO 9
+  analogReadResolution(12);       // readings 0-4095
 
-  // LCD Display
-  lcd.begin(16, 2); // set up the LCD's number of columns and rows
-  lcd.setCursor(0, 0);
-  lcd.print(F("Aida DSP Box")); // Print a message to the LCD.
-  lcd.setCursor(0, 1);
-  lcd.print(F("Reverb V0.1"));
-  
-  // DSP board
-  InitAida();	// Initialize DSP board
-  digitalWrite(RESET, HIGH); // Wake up DSP
-  delay(250);  // Start-up delay for DSP
-  program_download();    // Here we load program, parameters and hardware configuration to DSP
-  delay(20);
-  check_program(); // !!!Debug!!!
-  delay(5);
-  check_param(); // !!!Debug!!!
-  delay(5);
-  check_config(); // !!!Debug!!!
-  delay(2);
-  spettacolino();
-  //MasterVolumeStereo(DEVICE_ADDR_7bit, Single1, 1.00);    // With DAC in mute, set volume to 0dB
-  delay(1);   
-  AIDA_WRITE_REGISTER_BLOCK(DEVICE_ADDR_7bit, CoreRegisterR4Addr, CoreRegisterR4Size, CoreRegisterR4Data);    // Mute DAC Off
-  mix(10);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_Y, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(BTN, INPUT_PULLUP);
+
+  oled.begin(SSD1306_SWITCHED_CAPVCC, 0x3C);
+  oled.setTextColor(SSD1306_WHITE);
 }
 
-void loop()
-{
-  // put your main code here, to run repeatedly:
-  
-  if(digitalRead(ENC_PUSH)==LOW)  
-  {
-    digitalWrite(PIN_LED, HIGH);
-    digitalWrite(LED_1, LOW);
-    digitalWrite(LED_2, LOW);
-    delay(50);  // debounce
-    if(digitalRead(ENC_PUSH)==LOW)
-    {
-      count++;
-    }   
-  }
-  else
-  {
-    if(count>0 && count<10)
-      function = 1;
-    else if(count>10 && count<30)
-      function = 2;
-    else
-      function = 0;  // No function triggered on switch
-    count = 0;
-    digitalWrite(PIN_LED, LOW);
-    digitalWrite(LED_1, HIGH);
-    digitalWrite(LED_2, HIGH);
+void loop() {
+  int pct[4], worst = 0;
+  for (int i = 0; i < 4; i++) {
+    pct[i] = map(analogRead(sensorPin[i]), 0, 4095, 0, 100);
+    if (pct[i] > worst) worst = pct[i];
   }
 
-  if(function==1)
-  {
-    mute ^= 1;
+  if (digitalRead(BTN) == LOW) { muted = !muted; delay(250); }
+
+  const char* state = worst >= ALERT ? "ALERT" : worst >= CAUTION ? "CAUTION" : "NORMAL";
+  digitalWrite(LED_G, worst < CAUTION);
+  digitalWrite(LED_Y, worst >= CAUTION && worst < ALERT);
+  digitalWrite(LED_R, worst >= ALERT);
+
+  if (worst >= ALERT && !muted) tone(BUZZER, 2000);
+  else noTone(BUZZER);
+
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  for (int i = 0; i < 4; i++) {
+    oled.printf("%s: %3d%%\n", label[i], pct[i]);
   }
-  else if(function==2)
-  {
-    submenu ^=1; 
-  }
+  oled.setTextSize(2);
+  oled.setCursor(0, 44);
+  oled.print(state);
+  oled.display();
 
-  timec = millis();
-  if(timec-prevtimec >= 1000)  // Here we manage control interface every second
-  {
-    pot1 = analogRead(POT1);
-    pot1 = processpot(VOLMIN, VOLMAX, pot1);
-    //lcd.setCursor(5, 1);
-    //lcd.print(pot1);
-    //lcd.print(F("dB"));
-    
-    clearAndHome();    // !!!Warning use with real terminal emulation program
-    Serial.println(F("********************************"));
-    Serial.println(F("*    User control interface    *"));
-    Serial.println(F("*      AIDA Reverb Sketch      *"));
-    Serial.println(F("********************************"));
-    Serial.println(F("Press button rapidly to switch mute on/off,"));
-    Serial.println(F("press button for 1 sec to enter submenu."));
-    Serial.write('\n');
-    
-    Serial.print(F("Encoder pulses: "));
-    Serial.println(getPulses(), DEC);
-    if(mute == OFF)
-    {
-      if(submenu == OFF)
-      {
-        if(restoreflag == true)
-        {
-          restoreflag = false;
-          setPulses(OldPulses);
-        }
-        volume = processencoder(VOLMIN, VOLMAX, getPulses());
-
-        Serial.print(F("Master Vol. "));
-        Serial.print(volume, 1);
-        Serial.println(F("dB"));
-        
-        lcd.clear();
-        lcd.setCursor(0, 1);
-        lcd.print(volume,1);
-        lcd.print(F("dB"));
-
-        volume = pow(10, volume/20);    // From dB to linear conversion --> DSP takes only linear values in 5.28 fixed point format!!!
-        //MasterVolumeStereo(DEVICE_ADDR_7bit, Single1, volume);
-      }
-      else
-      {
-        //MasterVolumeStereo(DEVICE_ADDR_7bit, Single1, volume);
-      }			
-    }
-    else if(mute == ON)
-    {
-      //MasterVolumeStereo(DEVICE_ADDR_7bit, Single1, 0.00);
-      Serial.println(F("mute on"));
-    }
-    if(submenu==ON)
-    {
-      if(restoreflag == false)
-      {
-        restoreflag = true;
-        OldPulses = getPulses();  // Save actual Pulses for restoring when exit menu
-        setPulses(16);  // Restart from a known position
-      }
-      preset = (uint8_t)selectorwithencoder(getPulses(), 2);  // Use the encoder as a selector
-
-      switch(preset)
-      {
-      case 1:
-        Serial.println(F(" Mix 10%"));
-        mix(10);
-        break;
-      case 2:
-        Serial.println(F(" Mix 25%"));
-        mix(25);
-        break;
-      case 3:
-        Serial.println(F(" Mix 50%"));
-        mix(50);
-        break;
-      case 4:
-        Serial.println(F(" Mix 90%"));
-        mix(90);
-        break;
-      }
-      
-      Serial.write('\n');
-      Serial.print(F("    Selected preset: "));
-      Serial.println(preset, DEC);
-
-    }
-    else if(submenu==OFF)
-    {
-      Serial.write('\n');
-      Serial.println(F("    Submenu OFF"));
-    }
-    prevtimec = timec;
-  } 
-
-} // End void loop
-
-void spettacolino()
-{
-  byte i;
-  byte statusc = 0x00;
-
-  for(i=0;i<6;i++)
-  {
-    statusc ^= 1;
-    pinMode(PIN_LED, statusc);
-    delay(250);
-  }
-  pinMode(PIN_LED, HIGH);
+  Serial.printf("%d %d %d %d -> %s\n", pct[0], pct[1], pct[2], pct[3], state);
+  delay(200);
 }
-
-void clearAndHome(void)
-{
-  Serial.write(0x1b); // ESC
-  Serial.print(F("[2J")); // clear screen
-  Serial.write(0x1b); // ESC
-  Serial.print(F("[H")); // cursor to home
-}
-
-void check_program(void) 
-{
-  uint8_t value_wr = 0;
-  uint8_t buff_r[5];
-  uint8_t value_r;
-  uint16_t addr = progDataAddr;
-  uint16_t i, j, errors;
-  
-  Serial.println(F("Program checking..."));
-  
-  errors = 0;
-  for(i=0;i<progDataSize;i+=5) // Program address 1024 to 2047
-  {
-    memset(buff_r, 0, 5);
-    AIDA_READ_REGISTER(DEVICE_ADDR_7bit, addr, 5, buff_r); 
-    for(j=0;j<5;j++)
-    {
-      #ifdef __AVR__
-      //value_wr = pgm_read_byte_far(&progDataData[i+j]);
-      value_wr = pgm_read_byte_near(&progDataData[i+j]);
-      #else
-      value_wr = progDataData[i+j];
-      #endif
-      value_r = buff_r[j];
-      if(value_wr != value_r)
-      {
-        errors++;
-        break;
-      }
-    }
-    if(errors)
-      break;
-    addr++;
-    delayMicroseconds(100);
-  }
-
-  if(errors)
-  {
-    //Serial.print(F("i: "));
-    //Serial.println(i, DEC);
-    //Serial.print(F("j: "));
-    //Serial.println(j, DEC);
-    Serial.print(errors, DEC);
-    Serial.println(F(" errors during Program download")); 
-    Serial.print(F("Address: "));
-    Serial.println(addr, DEC);
-    Serial.print(F("Written = "));
-    Serial.print(F("0x"));
-    Serial.println(value_wr, HEX);
-    Serial.print(F("Readed = "));
-    Serial.print(F("0x"));
-    Serial.println(value_r, HEX);
-    while(1);
-  }
-  else
-  {
-    Serial.println(F("Program OK"));
-  }
-}
-
-void check_param(void)
-{
-  uint8_t value_wr = 0;
-  uint8_t buff_r[4];
-  uint8_t value_r;
-  uint16_t addr = regParamAddr;
-  uint16_t i, j, errors;
-  
-  Serial.println(F("Parameter checking..."));
-  
-  errors = 0;
-  for(i=0;i<regParamSize;i+=4) // 0 to 1023
-  {
-    memset(buff_r, 0, 4);
-    AIDA_READ_REGISTER(DEVICE_ADDR_7bit, addr, 4, buff_r); 
-    for(j=0;j<4;j++)
-    {
-      #ifdef __AVR__
-      //value_wr = pgm_read_byte_far(&regParamData[i+j]);
-      value_wr = pgm_read_byte_near(&regParamData[i+j]);
-      #else
-      value_wr = regParamData[i+j];
-      #endif
-      value_r = buff_r[j];
-      if(value_wr != value_r)
-      {
-        errors++;
-        break;
-      }
-    }
-    if(errors)
-      break;
-    addr++;
-    delayMicroseconds(100);
-  }
-  
-  if(errors)
-  {
-    Serial.print(errors, DEC);
-    Serial.println(F(" errors during Reg Param download")); 
-    Serial.print(F("Address: "));
-    Serial.println(addr, DEC);
-    Serial.print(F("Written = "));
-    Serial.print(F("0x"));
-    Serial.println(value_wr, HEX);
-    Serial.print(F("Readed = "));
-    Serial.print(F("0x"));
-    Serial.println(value_r, HEX);
-    while(1);
-  }
-  else
-  {
-    Serial.println(F("Reg Param OK"));
-  }
-}
-
-void check_config(void)
-{
-  uint8_t value_wr = 0;
-  uint8_t buff_r[HWConFigurationSize];
-  uint8_t value_r;
-  uint16_t addr = HWConFigurationAddr;
-  uint16_t i, errors;
-  
-  Serial.println(F("HW Config checking..."));
-  
-  errors = 0;
-  memset(buff_r, 0, HWConFigurationSize);
-  AIDA_READ_REGISTER(DEVICE_ADDR_7bit, addr, HWConFigurationSize, buff_r); // Read all parameters in one block   
-  
-  for(i=0;i<HWConFigurationSize;i++) //  2076 to 2087 
-  {
-    #ifdef __AVR__
-    //value_wr = pgm_read_byte_far(&HWConFigurationData[i]);
-    value_wr = pgm_read_byte_near(&HWConFigurationData[i]);
-    #else
-    value_wr = HWConFigurationData[i];
-    #endif
-    value_r = buff_r[i];
-    if(value_wr != value_r)
-    {
-      errors++;
-      break;
-    }
-  }
-  
-  if(errors)
-  {
-    Serial.print(errors, DEC);
-    Serial.println(F(" errors during HW config download")); 
-    Serial.print(F("Address: "));
-    Serial.println(addr, DEC);
-    Serial.print(F("Written = "));
-    Serial.print(F("0x"));
-    Serial.println(value_wr, HEX);
-    Serial.print(F("Readed = "));
-    Serial.print(F("0x"));
-    Serial.println(value_r, HEX);
-    while(1);
-  }
-  else
-  {
-    Serial.println(F("HW Config OK"));
-  }
-}
-
-void mix(uint8_t percent)
-{
-  float value = percent/100.00;
-
-  // MIX
-  AIDA_SAFELOAD_WRITE_VALUE(DEVICE_ADDR_7bit, Mixer, false, 1.00-value);  // Dry	 
-  AIDA_SAFELOAD_WRITE_VALUE(DEVICE_ADDR_7bit, Mixer+1, true, value);   // Wet
-}
-
